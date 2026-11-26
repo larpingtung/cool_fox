@@ -743,6 +743,9 @@ impl Layout {
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
                     match chunk_size {
+                        Some(4) if tiled_row.is_multiple_of(4) => {
+                            copy_runs::<4, DETILE>(src, dst, body, tiled_row, linear_row)
+                        }
                         Some(8) if tiled_row.is_multiple_of(8) => {
                             copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
                         }
@@ -1036,6 +1039,11 @@ mod tests {
                 dimension: Dimension::Tex3d,
                 depth: 16,
                 ..desc(64, 32, 7, 4, Swizzle::SW_4KB_S)
+            },
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 15,
+                ..desc(127, 37, 4, 2, Swizzle::SW_64KB_S)
             },
         ];
         for d in cases {
