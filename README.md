@@ -94,6 +94,25 @@ cargo build --locked --profile diag -p victory --features diagnostics
 
 See [docs/replay.md](docs/replay.md) for the existing frame-recording and replay workflow, and [docs/findings.md](docs/findings.md) for inherited performance notes. A replay is only representative of the workload captured; it does not replace full runtime testing.
 
+## Integrated runtime capabilities
+
+This fork also incorporates compatibility and renderer work from the parent
+project, [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox),
+at the integrated upstream revision `472e8417cd`:
+
+- In-place graphics-heap mapping and zero-copy constant-buffer paths.
+- More robust shader translation, including wave64 visibility recovery and
+  loop normalization.
+- Explicit pipeline root-signature creation for broader compiler compatibility.
+- Frame pacing, output-resolution and render-scale controls.
+- Synchronized video-frame copies and updated NVIDIA launcher defaults.
+- A reduced-memory launcher profile.
+
+These additions remain experimental on this fork. Their presence does not
+constitute validation against a complete target application build. The
+upstream commit is retained as a merge parent, and original source notices
+and contributor history are preserved.
+
 ## Validation status and limitations
 
 Validation work may include source review, Rust compilation, unit/integration tests, static analysis, isolated microbenchmarks and synthetic graphics replay.
