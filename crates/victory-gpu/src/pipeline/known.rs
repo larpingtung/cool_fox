@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -60,15 +60,22 @@ fn book() -> Option<&'static Mutex<Book>> {
         std::fs::create_dir_all(&dir).ok()?;
         let mut keys = HashSet::new();
         let mut shaders = HashSet::new();
-        let ends = [
-            walk_shaders(&dir, |_, hash, _, _| drop(shaders.insert(hash))),
-            walk_pipelines(&dir, |_, bytes| {
-                keys.extend(bytes.first_chunk::<16>().copied());
-            }),
-        ];
-        for (file, end) in [SHADERS, PIPELINES].iter().zip(ends) {
+        let shader_end = walk_shaders(&dir, |_, hash, _, _| {
+            shaders.insert(hash);
+        });
+        let (pipeline_end, pipeline_len) = walk_pipelines(&dir, |_, bytes| {
+            keys.extend(bytes.first_chunk::<16>().copied());
+        })
+        .inspect_err(|error| tracing::warn!(%error, "could not scan the pipeline book"))
+        .ok()?;
+        // Do not repair or append to a book that changed during startup.
+        if std::fs::metadata(dir.join(PIPELINES)).is_ok_and(|m| m.len() != pipeline_len) {
+            return None;
+        }
+        for (file, end) in [(SHADERS, shader_end), (PIPELINES, pipeline_end)] {
             let path = dir.join(file);
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > end)
+            if std::fs::metadata(&path)
+                .is_ok_and(|m| m.len() > end && (file != PIPELINES || pipeline_len == m.len()))
                 && let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path)
             {
                 let _ = f.set_len(end);
@@ -168,33 +175,50 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
 }
 
 /// Calls `f` with each pipeline's number and entry; where the last whole one
-/// ends.
-fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
-    let bytes = std::fs::read(dir.join(PIPELINES)).unwrap_or_default();
+/// ends and the length at open. An I/O error must not trigger a repair.
+fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> io::Result<(u64, u64)> {
+    let file = match std::fs::File::open(dir.join(PIPELINES)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    let mut file = BufReader::with_capacity(64 * 1024, file);
+    let mut entry = Vec::new();
     let (mut at, mut n) = (0, 0);
-    while let Some(head) = bytes.get(at..at + 4) {
-        let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
-        f(n, entry);
-        (at, n) = (at + 4 + size, n + 1);
+    let mut head = [0; 4];
+    while len - at >= 4 {
+        file.read_exact(&mut head)?;
+        let size = u32::from_le_bytes(head);
+        if u64::from(size) > len - at - 4 {
+            break;
+        }
+        let end = at + 4 + u64::from(size);
+        let size = size as usize;
+        if size > entry.capacity() {
+            entry.try_reserve(size - entry.len()).map_err(io::Error::other)?;
+        }
+        entry.resize(size, 0);
+        file.read_exact(&mut entry)?;
+        f(n, &entry);
+        (at, n) = (end, n + 1);
     }
-    at as u64
+    Ok((at, len))
 }
 
 /// How many pipelines are known in `dir`.
 pub fn count(dir: &Path) -> usize {
     let mut n = 0;
-    walk_pipelines(dir, |_, _| n += 1);
-    n
+    walk_pipelines(dir, |_, _| n += 1).map_or(0, |_| n)
 }
 
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
+    let result = walk_pipelines(dir, |_, e| {
         all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
     });
-    all
+    result.map_or_else(|_| Vec::new(), |_| all)
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
@@ -224,11 +248,14 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
+    let scan = walk_pipelines(dir, |n, bytes| {
         if wanted.contains(&n) {
             entries.insert(n, bytes.to_vec());
         }
     });
+    if scan.is_err() {
+        return;
+    }
     let mut read = |hash: &[u8; 32]| {
         let &(_, at, len) = places.get(hash)?;
         let mut bytes = vec![0; len as usize];
@@ -464,7 +491,7 @@ mod tests {
         std::fs::write(dir.join(PIPELINES), &bytes[..bytes.len() - 5]).unwrap();
         assert_eq!(count(&dir), 2);
         assert_eq!(keys(&dir)[1], "01".repeat(16));
-        assert_eq!(walk_pipelines(&dir, |_, _| ()), 48);
+        assert_eq!(walk_pipelines(&dir, |_, _| ()).unwrap(), (48, 67));
         let mut shader = vec![5u8];
         shader.extend([9; 32]);
         shader.extend(4u32.to_le_bytes());
@@ -476,5 +503,38 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pipeline_scan_preserves_order_and_the_last_complete_offset() {
+        let dir = std::env::temp_dir().join(format!("victory-pipeline-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PIPELINES);
+        assert_eq!(count(&dir), 0);
+        let large = vec![0x45; 64 * 1024 + 1];
+        let records = [large.as_slice(), &[][..], &[7, 3][..]];
+        let mut bytes = Vec::new();
+        for entry in records {
+            bytes.extend((entry.len() as u32).to_le_bytes());
+            bytes.extend(entry);
+        }
+        let end = bytes.len() as u64;
+        for tail in [&[][..], &u32::MAX.to_le_bytes()[..3], &u32::MAX.to_le_bytes()[..]] {
+            bytes.truncate(end as usize);
+            bytes.extend(tail);
+            std::fs::write(&path, &bytes).unwrap();
+            let mut seen = 0;
+            let actual = walk_pipelines(&dir, |n, entry| {
+                assert_eq!(n, seen);
+                assert_eq!(entry, records[n]);
+                seen += 1;
+            });
+            assert_eq!(actual.unwrap(), (end, bytes.len() as u64));
+            assert_eq!(seen, records.len());
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(walk_pipelines(&dir, |_, _| unreachable!()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
