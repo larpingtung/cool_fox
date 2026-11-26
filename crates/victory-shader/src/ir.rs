@@ -274,6 +274,11 @@ fn unspill(
     lanes: u8,
     vgprs: u16,
 ) -> Vec<(usize, u8, u8)> {
+    // Without lane moves there is no spill to analyse or rewrite.
+    if !list.iter().any(|inst| matches!(inst.name(), Some("v_writelane_b32" | "v_readlane_b32"))) {
+        return Vec::new();
+    }
+
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
     fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
         let Fields::Valu(v) = fields else { return None };
