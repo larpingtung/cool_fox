@@ -252,19 +252,15 @@ impl Tables {
     }
 }
 
-/// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
-/// the block count. The stream carries no size: bytes after the last one the
-/// lanes need are ignored, a stream that runs out is an error.
-pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+fn layout(bc: u8, size: usize) -> Result<(usize, &'static [u8], usize), Error> {
     let block = match bc {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,
         _ => return Err(Error("unsupported BC format")),
     };
-    if dst.is_empty() || !dst.len().is_multiple_of(block) {
+    if size == 0 || !size.is_multiple_of(block) {
         return Err(Error("destination is not a whole number of blocks"));
     }
-    let blocks = dst.len() / block;
     let (widths, per): (&[u8], usize) = match bc {
         1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
         3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
@@ -273,8 +269,33 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
+    Ok((block, widths, per))
+}
+
+/// Bytes of request-local heap scratch, excluding input, output and tables.
+pub fn scratch_bytes(bc: u8, size: usize) -> Result<usize, Error> {
+    let (block, widths, per) = layout(bc, size)?;
+    let history = match bc {
+        6 => size_of::<(Bc6Ep, Bc6Ix)>(),
+        7 => size_of::<(Bc7Ep, Bc7Ix)>(),
+        _ => size_of::<Plain>(),
+    } * HISTORY;
+    (size / block).checked_mul(widths.len() * per)
+        .and_then(|records| records.checked_add(history))
+        .ok_or(Error("scratch size overflow"))
+}
+
+/// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
+/// the block count. The stream carries no size: bytes after the last one the
+/// lanes need are ignored, a stream that runs out is an error.
+pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+    let (block, widths, per) = layout(bc, dst.len())?;
+    let blocks = dst.len() / block;
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
+    let len = blocks.checked_mul(stride).ok_or(Error("scratch size overflow"))?;
+    let mut records = Vec::new();
+    records.try_reserve_exact(len).map_err(|_| Error("could not allocate records"))?;
+    records.resize(len, 0);
     let mut next = src.iter().copied();
     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
     let records = records.chunks_exact(stride);
