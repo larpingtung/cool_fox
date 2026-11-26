@@ -28,6 +28,9 @@
 # Executables, libraries, symbols
 *.exe
 *.dll
+*.log
+*.out
+validate_*.txt
 *.pdb
 *.lib
 *.sys
