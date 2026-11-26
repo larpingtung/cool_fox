@@ -98,7 +98,7 @@ See [docs/replay.md](docs/replay.md) for the existing frame-recording and replay
 
 Validation work may include source review, Rust compilation, unit/integration tests, static analysis, isolated microbenchmarks and synthetic graphics replay.
 
-**No complete target-application build has been run against this experimental fork as part of the current validation.** No claims are made here about real-world FPS, sustained runtime performance, minimum RAM/VRAM requirements, long-session stability or broad hardware compatibility.
+**The latest experimental optimization changes described here have not yet been tested against a complete target-application build.** No claims are made about real-world FPS gains, sustained runtime performance, minimum RAM/VRAM requirements, long-session stability or broad hardware compatibility.
 
 Any published measurement should identify:
 - The exact source revision and build configuration.
