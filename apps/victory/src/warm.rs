@@ -152,14 +152,14 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
     let hung = AtomicBool::new(false);
     let mut made = 0;
     std::thread::scope(|s| {
-        s.spawn(|| {
+        let watchdog = s.spawn(|| {
             while !over.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
                 if lock(&heard).elapsed() > LONGEST {
                     hung.store(true, Ordering::Relaxed);
                     let _ = lock(&process).kill();
                     return;
                 }
+                std::thread::park_timeout(Duration::from_millis(500));
             }
         });
         for line in BufReader::new(out).lines().map_while(Result::ok) {
@@ -174,6 +174,7 @@ fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Opt
             }
         }
         over.store(true, Ordering::Relaxed);
+        watchdog.thread().unpark();
     });
     let status = lock(&process).wait();
     let well = status.as_ref().is_ok_and(|s| s.success());

@@ -190,6 +190,8 @@ pub(crate) struct Recording {
 #[derive(Default)]
 struct Inner {
     chunks: VecDeque<Vec<u64>>,
+    /// Owned by the recording even if its last partial stream is abandoned.
+    uploads: Vec<Upload>,
     /// Streams translated (commands may name places in them until the end).
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
@@ -250,6 +252,12 @@ impl Recording {
             inner.kept.push(chunk);
             if closed {
                 inner.closed = true;
+                // RESET ran before CLOSE. Hand ownership to the backing list before
+                // publishing done; detach then keeps these through GPU retirement.
+                if !inner.uploads.is_empty() {
+                    // SAFETY: our translation thread alone owns the unpublished list.
+                    *held(unsafe { &(*back.cast::<List>()).uploads }) = std::mem::take(&mut inner.uploads);
+                }
                 let kept = std::mem::take(&mut inner.kept);
                 self.done.store(true, Release);
                 self.moved.notify_all();
@@ -454,7 +462,6 @@ const fn after(n: u64) -> u64 {
 }
 const RESET: u64 = after(0);
 const CLOSE: u64 = after(1);
-const UPLOAD: u64 = after(2);
 const BARRIER: u64 = after(3);
 const BARRIER_GROUPS: u64 = after(4);
 const VIEWPORTS: u64 = after(5);
@@ -529,16 +536,16 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
         return std::ptr::null_mut();
     }
     let front = front(this);
-    if front.closed || front.recording.is_none() {
+    let Some(recording) = front.recording.as_ref().filter(|_| !front.closed) else {
         return std::ptr::null_mut();
-    }
+    };
     let Some(mut block) = Upload::new(len) else {
         return std::ptr::null_mut();
     };
     let start = block.start();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let place = unsafe { start.add(start.align_offset(align)) };
-    front.put(UPLOAD, &[Box::into_raw(Box::new(block)) as u64]);
+    held(&recording.inner).uploads.push(block);
     place
 }
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
@@ -690,14 +697,6 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         calls += 1;
         if calls % 64 == 0 {
             skip = left();
-        }
-        if op == UPLOAD {
-            // SAFETY: made by `allocate_upload`, named once.
-            let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
-            // SAFETY: a list of ours.
-            let uploads = unsafe { &(*list.cast::<List>()).uploads };
-            held(uploads).push(block);
-            continue;
         }
         if skip && op != CLOSE && op != RESET {
             continue;
@@ -874,6 +873,21 @@ mod tests {
                 "slot {slot} is written down and not there"
             );
         }
+    }
+
+    #[test]
+    fn abandoned_partial_recording_releases_its_upload() {
+        let mut list = super::super::boxed(0, std::ptr::null(), true);
+        list.thin.begin(0, std::ptr::null());
+        let this = (&raw const *list).cast();
+        let address = allocate_upload(this, 4096, 16) as usize;
+        assert_ne!(address, 0);
+        // An outstanding translator must still own the recording after reset.
+        let worker = list.thin.recording.clone().unwrap();
+        list.thin.begin(0, std::ptr::null());
+        assert!(crate::upload::block(address).is_some());
+        drop(worker);
+        assert!(crate::upload::block(address).is_none());
     }
 
     /// Arguments come out of a stream as they went in.

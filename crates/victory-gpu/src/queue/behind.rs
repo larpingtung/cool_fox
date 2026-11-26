@@ -381,8 +381,9 @@ enum Job {
     /// A part of a submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission, or a part of one: the lists' host sides and the order
-    /// they run in.
-    Run(usize, Vec<crate::list::Detached>, Vec<usize>),
+    /// they run in. A list named more than once shares one set of native
+    /// lists between its occurrences.
+    Run(usize, crate::list::Run),
     /// A submission whose lists are being translated ([`crate::list::thin`]):
     /// the parts of it are known when they are.
     Lists(usize, Recordings),
@@ -469,7 +470,8 @@ impl Work for Job {
         }
         // Nothing but waits and signals that a submission may follow.
         let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
+            Job::Run(_, crate::list::Run::Owned(lists, order)) => (1, (&*lists, &*order), &[][..]),
+            Job::Run(..) => return Err(next),
             Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
             _ => return Err(next),
         };
@@ -489,17 +491,19 @@ impl Work for Job {
                 }
             }
             Job::Signal(..) => {}
-            Job::Run(_, more, order) => {
+            Job::Run(_, crate::list::Run::Owned(more, order)) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
                 if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Run(..) | Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
-            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
+            Job::Run(queue, crate::list::Run::Owned(lists, order)) => {
+                (queue, lists, order, Vec::new(), Vec::new())
+            }
             Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
             other => {
                 *self = other;
@@ -508,11 +512,17 @@ impl Work for Job {
         };
         let run = matches!(next, Job::Run(..));
         match next {
-            Job::Run(_, more, then) => {
+            Job::Run(_, crate::list::Run::Owned(more, then)) => {
                 parts.push(order.len());
                 order.extend(then.into_iter().map(|i| i + lists.len()));
                 lists.extend(more);
                 STATS[JOINED].fetch_add(1, Relaxed);
+            }
+            other @ Job::Run(..) => {
+                // Not reached: a shared run was refused above. Restore what
+                // was taken so a caller that ever gets here keeps its work.
+                *self = Job::Joined(queue, lists, order, parts, signals);
+                return Err(other);
             }
             Job::Signal(fence, value) => signals.push((fence, value)),
             _ => {}
@@ -540,13 +550,27 @@ impl Work for Job {
         match self {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
-            Job::Run(queue, lists, order) => {
+            Job::Run(queue, run) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
-                crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
-                match crate::host::host() {
-                    Some(host) => host.execute_late(lists, order),
-                    None => drop(lists),
+                {
+                    let count = match &run {
+                        crate::list::Run::Owned(_, order)
+                        | crate::list::Run::Shared(_, order) => order.len(),
+                    };
+                    crate::capture::op(queue, || {
+                        format!("RUN submission of {count} lists (its thread's)")
+                    });
+                }
+                match run {
+                    crate::list::Run::Owned(lists, order) => match crate::host::host() {
+                        Some(host) => host.execute_late(lists, order),
+                        None => drop(lists),
+                    },
+                    // Repeated lists run synchronously: the shared set must
+                    // stay alive until its last occurrence, and the late
+                    // line takes ownership of a list for one flight only.
+                    crate::list::Run::Shared(shared, order) => shared.run(&order),
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
@@ -770,7 +794,12 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
-    let first = lists.iter().position(|&l| crate::list::cut_list(l)).unwrap_or(lists.len());
+    let repeated = crate::list::has_repeats(lists);
+    let cut_at = lists.iter().position(|&l| crate::list::cut_list(l)).unwrap_or(lists.len());
+    // A repeated list cannot be detached once for the fast prefix and again
+    // for the held suffix; let `detach_parts` share its native lists across
+    // every occurrence.
+    let first = if repeated { 0 } else { cut_at };
     #[cfg(feature = "diagnostics")]
     crate::capture::op(queue, || {
         let named: Vec<String> = lists
@@ -788,12 +817,12 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     let mut jobs: Vec<Job> = Vec::new();
     if first > 0 {
         let (taken, order) = crate::list::detach(&lists[..first]);
-        jobs.push(Job::Run(queue, taken, order));
+        jobs.push(Job::Run(queue, crate::list::Run::Owned(taken, order)));
     }
     if first < lists.len() {
-        for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+        for (waits, run) in crate::list::detach_parts(&lists[first..]) {
             jobs.extend(waits.into_iter().map(Job::Value));
-            jobs.push(Job::Run(queue, taken, order));
+            jobs.push(Job::Run(queue, run));
         }
     }
     jobs

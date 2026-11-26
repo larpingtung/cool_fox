@@ -11,8 +11,8 @@
 //! Submitted requests of every queue run on one pool of workers, as the
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
-//! per level, counted in bytes), with at most the staging buffer's worth of
-//! compressed source in flight. Each request reads its source (a file or
+//! per level, counted in bytes), with a staging budget for concurrent
+//! request buffers. Each request reads its source (a file or
 //! memory), inflates zlib data and/or unpacks BCPack data, and writes the
 //! destination (an address, or physical pages). Completion is what stays
 //! in order: a status entry is written once every request enqueued before
@@ -122,7 +122,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
@@ -145,16 +145,17 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     if stream_log::on() {
-        stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+        stream_log::line(format_args!("F\t{:x}\t{name}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    if walls_trace() != 0 {
+        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).insert(file as usize, name);
+    }
     put(out, file)
 }
 
@@ -166,6 +167,9 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     tracing::info!(
         capacity,
         name = text(name),
@@ -198,6 +202,9 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -457,10 +464,24 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    if walls_trace() == 0 {
+        return release(this);
+    }
+    // A new open can reuse this address as soon as release drops the box.
+    // Hold the registry lock so removal cannot erase the new file's name.
+    let mut files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let left = release(this);
+    if left == 0 {
+        files.remove(&(this as usize));
+    }
+    left
+}
+
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -546,8 +567,9 @@ struct Lanes {
     next_id: u64,
     /// Submission order over all queues.
     next_seq: u64,
-    /// Bytes of staging held by running requests, and the limit.
+    /// Bytes reserved by running requests, and the limit.
     staged: u64,
+    staging_peak: u64,
     staging: u64,
     /// A start waited for staging space since the last finish.
     starved: bool,
@@ -613,6 +635,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
+                    staging_peak: 0,
                     staging: STAGING,
                     starved: false,
                     clock: [0; 3],
@@ -662,7 +685,7 @@ fn walls_trace() -> u8 {
 
 /// The files opened, by the address of our file object, with their paths
 /// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+static WALLS_FILES: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -675,7 +698,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        files.get(&source).cloned().unwrap_or_else(|| "?".to_string())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -823,12 +846,14 @@ impl Lanes {
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
+                peak_reserved_bytes = self.staging_peak,
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
+            self.staging_peak = self.staged;
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
@@ -856,6 +881,7 @@ impl Lanes {
         lane.reads.pop_front();
         lane.running.insert(seq);
         self.staged += staging;
+        self.staging_peak = self.staging_peak.max(self.staged);
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
@@ -964,15 +990,26 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Peak request-local buffer reservation. Page destinations may have to
+/// scatter from a temporary even when most can be filled directly.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
+    let options = request.options;
+    let input = u64::from(request.source_size);
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let source = if compressed && options & MEMORY_SOURCE == 0 { input } else { 0 };
+    let scatter = if options & PAGE_DESTINATION != 0 {
+        if compressed { u64::from(request.destination_size) } else { input }
     } else {
         0
+    };
+    let bc = ((options & BCPACK) >> 1) as u8;
+    let decode = bcpack::scratch_bytes(bc, request.destination_size as usize).unwrap_or(0) as u64;
+    if bc != 0 && options & ZLIB != 0 {
+        let packed = u64::from(request.intermediate_size);
+        // The file buffer dies before we start decoding the intermediate.
+        packed + source.max(scatter + decode)
+    } else {
+        source + scatter + decode
     }
 }
 
@@ -1410,8 +1447,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        let mut packed = staging_buffer(request.intermediate_size as usize)
+            .map_err(|hr| fail(hr, "allocating the intermediate"))?;
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        drop(source);
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
@@ -1519,6 +1558,13 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
+fn staging_buffer(len: usize) -> Result<Vec<u8>, HRESULT> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| E_OUTOFMEMORY)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
 fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
@@ -1528,7 +1574,7 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = staging_buffer(size)?;
     read_into(request, &mut bytes)?;
     Ok(Cow::Owned(bytes))
 }
@@ -1656,7 +1702,7 @@ fn into_pages(
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
+    let mut data = staging_buffer(len)?;
     let n = fill(&mut data)?;
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
@@ -1884,6 +1930,37 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let file = open(&path);
         (dir, file)
+    }
+
+    #[test]
+    fn failed_file_publication_does_not_hold_a_read_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed-open.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        assert_eq!(open_file(std::ptr::null(), wide.as_ptr(), std::ptr::null(), std::ptr::null_mut()), E_INVALIDARG);
+        // The factory opens with FILE_SHARE_READ only. A leaked handle denies writing.
+        std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    }
+
+    #[test]
+    fn trace_paths_live_only_until_the_last_file_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("path-lifetime.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let name = path.to_string_lossy();
+        let count = || WALLS_FILES.lock().unwrap().values().filter(|s| s.as_str() == name).count();
+        for _ in 0..64 {
+            let file = open(&path);
+            let add: extern "system" fn(*mut c_void) -> u32 = call(file, 8);
+            let release: extern "system" fn(*mut c_void) -> u32 = call(file, 16);
+            assert_eq!(add(file), 2);
+            assert_eq!(release(file), 1);
+            assert_eq!(count(), usize::from(walls_trace() != 0));
+            assert_eq!(release(file), 0);
+        }
+        assert_eq!(count(), 0, "closed files left path records behind");
+
     }
 
     fn pattern(n: usize) -> Vec<u8> {
@@ -2210,6 +2287,7 @@ mod tests {
             next_id: 0,
             next_seq: 0,
             staged: 0,
+            staging_peak: 0,
             staging,
             starved: false,
             clock: [0; 3],
@@ -2273,6 +2351,27 @@ mod tests {
         l.submit(0, false);
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
+        assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_counts_the_combined_decode_peak() {
+        let mut l = lanes(32 << 20);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let mib = 1u32 << 20;
+        let mut r = request(ZLIB | (7 << 1) | PAGE_DESTINATION, std::ptr::null_mut(),
+                            (6 * mib) as usize, std::ptr::null(), 0, mib as usize);
+        r.intermediate_size = 4 * mib;
+        let peak = u64::from(22 * mib) + (256 * 116); // packed + scatter + BC7 records + history
+        assert_eq!(staging_bytes(&r), peak);
+        for _ in 0..2 {
+            l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Read(Read { request: r, note: Note::default() }));
+        }
+        l.submit(0, false);
+        let first = l.start().unwrap();
+        assert!(l.start().is_none(), "two simultaneous decode peaks exceed 32 MiB");
+        assert_eq!(l.staging_peak, peak);
+        l.finish(&first, Ok(()));
         assert!(l.start().is_some());
     }
 

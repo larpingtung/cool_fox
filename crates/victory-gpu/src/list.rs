@@ -248,10 +248,24 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
-/// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+// Fail before consulting the pool, so tests are independent of warm allocators.
+#[cfg(all(windows, test))]
+std::thread_local! {
+    static FAIL_FRESH_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A host list open for recording: a recycled list or a new one. Queue
+/// submission and memory waits have no HRESULT with which to report failure.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+fn fresh_list(operation: &str) -> crate::host::HostList {
+    #[cfg(test)]
+    if FAIL_FRESH_AFTER.with(|left| match left.get() {
+        Some(0) => true,
+        Some(n) => { left.set(Some(n - 1)); false }
+        None => false,
+    }) {
+        crate::host::fail(format_args!("{operation}: injected host command-list allocation failure"));
+    }
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
@@ -261,8 +275,11 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle(list, _)) => list,
+        None => crate::host::host()
+            .unwrap_or_else(|| crate::host::fail(format_args!("{operation}: no host D3D12 device")))
+            .new_list()
+            .unwrap_or_else(|e| crate::host::fail(format_args!("{operation}: host command-list allocation failed: {e}"))),
     }
 }
 
@@ -326,14 +343,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
-        // shortcut: without a new host list the wait stands before the part
-        // it was recorded in.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
-        list.gate.push(wait);
-        return;
-    };
+    let fresh = fresh_list("cutting a command list at a memory wait");
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -365,11 +375,48 @@ pub(crate) fn cut_list(this: This) -> bool {
     !list.earlier.is_empty() || !list.gate.is_empty()
 }
 
-/// What a queue is given for submitted lists that were cut at their waits:
-/// the waits it stands at, the host lists it runs once they are met, and
-/// the order those run in.
+pub(crate) fn has_repeats(lists: &[This]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    lists.len() > 1 && lists.iter().copied().any(|l| !l.is_null() && !seen.insert(l))
+}
+
+/// A submission's host lists and the order they run in. Most submissions
+/// own their lists; a list named more than once shares one set of native
+/// lists between all of its occurrences.
 #[cfg(windows)]
-pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
+pub(crate) enum Run {
+    Owned(Vec<Detached>, Vec<usize>),
+    Shared(std::sync::Arc<SharedRun>, Vec<usize>),
+}
+
+/// The native lists of a title list that a submission names more than
+/// once. Every occurrence runs the same lists again; they stay alive until
+/// the last occurrence has run, and only then are they reset and pooled.
+#[cfg(windows)]
+pub(crate) struct SharedRun(Vec<Detached>);
+
+#[cfg(windows)]
+impl SharedRun {
+    /// Each step waits for completion before the same native list can be
+    /// submitted again. The last owner can then reset the entire recording.
+    pub(crate) fn run(self: std::sync::Arc<Self>, order: &[usize]) {
+        let host = crate::host::host().unwrap_or_else(|| {
+            crate::host::fail(format_args!("no host GPU for a repeated command list"))
+        });
+        let runs: Vec<_> = order.iter().map(|&i| self.0[i].host()).collect();
+        host.execute(&runs);
+        if let Some(Self(lists)) = std::sync::Arc::into_inner(self) {
+            let ran: Vec<_> = (0..lists.len()).collect();
+            recycle(lists, &ran);
+        }
+    }
+}
+
+/// What a queue is given for submitted lists that were cut at their waits:
+/// the waits it stands at, then the lists it runs once they are met, in
+/// the order the submission named them.
+#[cfg(windows)]
+pub(crate) type Parts = Vec<(Vec<ValueWait>, Run)>;
 
 /// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
 /// and leaves each list a new, closed host list for its next reset, as
@@ -378,48 +425,66 @@ pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 /// waits join the entry before them. The list's upload memory and draw
 /// state (its dynamic descriptor slots) go with its last part, which runs
 /// last.
-/// shortcut: a list the submission names a second time runs again only if
-/// it has one part and that part is in the entry being filled; otherwise
-/// the second naming is dropped (logged once).
+///
+/// A title list named more than once is detached once. Every occurrence
+/// appends that list's parts again, all naming the same native lists; the
+/// shared set is reset and pooled only after the last occurrence has run.
+/// This holds for a list of one part and for one cut at several waits.
 #[cfg(windows)]
 pub(crate) fn detach_parts(lists: &[This]) -> Parts {
-    let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
-    // The lists taken: where its one host list is (entry, place), or none
-    // for a list of several parts.
-    let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
-    for &this in lists {
+    detach_parts_with_waits(lists, &[])
+}
+
+/// Also used by whole-list split mode, where waits are recorded externally.
+#[cfg(windows)]
+pub(crate) fn detach_parts_with_waits(lists: &[This], by: &[Vec<ValueWait>]) -> Parts {
+    struct Unique {
+        this: This,
+        /// Whether the submission names it again.
+        repeated: bool,
+        first: usize,
+        /// The waits and host-list places of one occurrence.
+        steps: Vec<(Vec<ValueWait>, Vec<usize>)>,
+        /// One occurrence's host lists, taken when it is built. `None` for
+        /// a list named more than once: its lists live in `shared`.
+        pieces: Option<Vec<Option<Detached>>>,
+        shared: Option<std::sync::Arc<SharedRun>>,
+    }
+
+    // The distinct lists, in the order the submission first names them.
+    let mut unique: Vec<Unique> = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    for (first, &this) in lists.iter().enumerate() {
         if this.is_null() {
             continue;
         }
-        if let Some(&(_, at)) = seen.iter().find(|(t, _)| *t == this) {
-            match at {
-                Some((entry, place)) if entry + 1 == parts.len() => parts[entry].2.push(place),
-                _ => {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!("a list named twice by a submission that waits for memory values runs once")
-                    });
-                }
-            }
-            continue;
+        let next = unique.len();
+        let i = *index.entry(this).or_insert(next);
+        if i == next {
+            unique.push(Unique { this, repeated: false, first, steps: Vec::new(), pieces: None, shared: None });
+        } else {
+            unique[i].repeated = true;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
+    }
+
+    for u in &mut unique {
+        let fresh = fresh_list("detaching command-list parts");
         // A new host list is open; the title's next call on its list is a
         // reset, which wants it closed.
         fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
-        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
-            continue;
-        };
+        let list = unsafe { &mut *u.this.cast_mut().cast::<List>() };
+        let host = list.host.replace(fresh).unwrap_or_else(|| {
+            crate::host::fail(format_args!("a submitted command list had no native recording"))
+        });
         let earlier = std::mem::take(&mut list.earlier);
-        let gate = std::mem::take(&mut list.gate);
+        let mut gate = std::mem::take(&mut list.gate);
+        if let Some(waits) = by.get(u.first) {
+            gate.extend_from_slice(waits);
+        }
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
         let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
-        let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
             .map(|part| {
@@ -441,22 +506,66 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 _state: state,
             },
         ));
-        let mut last = None;
-        for (waits, detached) in pieces {
-            if !waits.is_empty() {
-                parts.push((waits, Vec::new(), Vec::new()));
+
+        // One occurrence's steps: a new step at every part that waits, and
+        // host lists without waits join the step before them.
+        for (i, (waits, _)) in pieces.iter().enumerate() {
+            if !waits.is_empty() || u.steps.is_empty() {
+                u.steps.push((waits.clone(), Vec::new()));
             }
-            let entry = parts.len() - 1;
-            let (_, taken, order) = &mut parts[entry];
-            let place = taken.len();
-            order.push(place);
-            taken.push(detached);
-            last = Some((entry, place));
+            u.steps.last_mut().unwrap().1.push(i);
         }
-        seen.push((this, if single { last } else { None }));
+
+        if u.repeated {
+            let taken = pieces.into_iter().map(|(_, d)| d).collect();
+            u.shared = Some(std::sync::Arc::new(SharedRun(taken)));
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!("a submission names a command list more than once: its native lists are shared until the last occurrence has run")
+            });
+        } else {
+            u.pieces = Some(pieces.into_iter().map(|(_, d)| Some(d)).collect());
+        }
     }
-    // (The first entry is empty if the first list begins with a wait.)
-    parts.retain(|(_, taken, _)| !taken.is_empty());
+
+    let mut parts: Parts = Vec::new();
+    for &this in lists {
+        if this.is_null() {
+            continue;
+        }
+        let u = &mut unique[index[&this]];
+        if let Some(shared) = &u.shared {
+            for (waits, order) in &u.steps {
+                parts.push((
+                    waits.clone(),
+                    Run::Shared(shared.clone(), order.clone()),
+                ));
+            }
+            continue;
+        }
+        // One occurrence: its host lists can be moved into the steps.
+        for (waits, order) in &u.steps {
+            let Some(pieces) = u.pieces.as_mut() else {
+                continue;
+            };
+            let mut taken = Vec::new();
+            for &i in order {
+                if let Some(detached) = pieces.get_mut(i).and_then(Option::take) {
+                    taken.push(detached);
+                }
+            }
+            if taken.is_empty() {
+                continue;
+            }
+            if waits.is_empty() && let Some((_, Run::Owned(previous, order))) = parts.last_mut() {
+                order.extend(previous.len()..previous.len() + taken.len());
+                previous.extend(taken);
+            } else {
+                let order = (0..taken.len()).collect();
+                parts.push((waits.clone(), Run::Owned(taken, order)));
+            }
+        }
+    }
     parts
 }
 
@@ -475,9 +584,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
+        let fresh = fresh_list("detaching a command list");
         // A new host list is open; the title's next call on its list is a
         // reset, which wants it closed.
         fresh.close();
@@ -485,9 +592,9 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
-                continue;
-            };
+            let host = (*list).host.replace(fresh).unwrap_or_else(|| {
+                crate::host::fail(format_args!("a submitted command list had no native recording"))
+            });
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
@@ -606,13 +713,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: (!thin).then(|| fresh_list("creating a command list")),
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -649,6 +750,12 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn list_release(this: This) -> u32 {
     object::release_boxed::<List>(this)
 }
+impl Drop for List {
+    fn drop(&mut self) {
+        // Remove the old recording before the allocator can reuse this address.
+        clear_uncut_waits(std::ptr::from_ref(self).cast());
+    }
+}
 extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
@@ -667,10 +774,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     let _called = crate::timeline::span("the title's list Reset");
     // A wait recorded and never submitted goes with the recording.
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|&(list, _)| list != this as usize);
+    clear_uncut_waits(this);
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
@@ -2047,6 +2151,15 @@ impl ValueWait {
 /// The waits lists recorded since their last reset, by list.
 static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
 
+fn clear_uncut_waits(this: This) {
+    #[cfg(windows)]
+    if crate::queue::cuts() {
+        // These waits are owned by List::gate or Part, never by VALUE_WAITS.
+        return;
+    }
+    VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(list, _)| list != this as usize);
+}
+
 /// The waits of the submitted `lists` that are not met yet (taken from
 /// them): what the console's GPU would stop at. The title orders work
 /// between its queues this way (the title: the compute queue's
@@ -2218,9 +2331,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
-            return;
-        };
+        let fresh = fresh_list("cutting a command list after a completion write");
         current.close();
         if let Some(done) = list.host.replace(fresh) {
             // The part so far keeps its waits; nothing stands before the
@@ -2382,6 +2493,215 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_cut_list_runs_both_sides_of_its_wait_twice() {
+        let mut list = boxed(0, std::ptr::null(), false);
+        let this = std::ptr::from_mut(&mut *list).cast::<Object>().cast_const();
+        let mut mark = 0u32;
+        let address = std::ptr::from_mut(&mut mark) as u64;
+        defer_write(this, address, Written::Value(1), 4);
+        cut(this, ValueWait { address, comparison: 3, reference: 1, wide: false });
+        defer_write(this, address, Written::Value(2), 4);
+        close(this);
+        assert_eq!(observations(detach_parts(&[this, this]), address), [1, 2, 1, 2]);
+    }
+
+    #[cfg(windows)]
+    fn observations(parts: Parts, address: u64) -> Vec<u32> {
+        let mut observed = Vec::new();
+        for (waits, run) in parts {
+            assert!(waits.iter().all(ValueWait::met));
+            match run {
+                Run::Shared(shared, order) => shared.run(&order),
+                Run::Owned(taken, order) => {
+                    let host = crate::host::host().expect("D3D12 test device");
+                    for &i in &order {
+                        host.execute_sync_internal(taken[i].host());
+                    }
+                    recycle(taken, &order);
+                }
+            }
+            // SAFETY: the caller keeps the word live across its completed writes.
+            observed.push(unsafe { (address as *const u32).read_volatile() });
+        }
+        observed
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_lists_keep_uploads_through_multiple_cuts_and_a_prefix() {
+        let mut prefix = boxed(0, std::ptr::null(), false);
+        let mut cut_list = boxed(0, std::ptr::null(), false);
+        let prefix = std::ptr::from_mut(&mut *prefix).cast::<Object>().cast_const();
+        let cut_list = std::ptr::from_mut(&mut *cut_list).cast::<Object>().cast_const();
+        let mut mark = 0u32;
+        let address = std::ptr::from_mut(&mut mark) as u64;
+        defer_write(prefix, address, Written::Value(9), 4);
+        close(prefix);
+        for value in [1, 2, 3] {
+            defer_write(cut_list, address, Written::Value(value), 4);
+            if value != 3 {
+                cut(cut_list, ValueWait { address, comparison: 3, reference: value, wide: false });
+            }
+        }
+        let mut upload = Upload::new(256).unwrap();
+        let upload_address = upload.start() as usize;
+        // SAFETY: this is the live recording we just made.
+        unsafe { &*cut_list.cast::<List>() }.uploads.lock().unwrap().push(upload);
+        close(cut_list);
+        let mut parts = detach_parts(&[prefix, cut_list, cut_list, prefix, cut_list]);
+        let tail = parts.pop().unwrap();
+        assert_eq!(observations(parts, address), [9, 1, 2, 3, 1, 2, 3, 9, 1, 2]);
+        assert_eq!(crate::upload::block(upload_address), Some((upload_address, 256)));
+        assert_eq!(observations(vec![tail], address), [3]);
+        // A concurrent recorder may already have reused the address, so the
+        // assertion above is about retention, not global address reuse.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_lists_run_through_the_title_queue() {
+        const CASE: &str = "VICTORY_TEST_REPEAT_QUEUE";
+        if let Ok(mode) = std::env::var(CASE) {
+            use std::cell::UnsafeCell;
+            let mark = UnsafeCell::new(0u32);
+            let gate = UnsafeCell::new(u32::from(mode == "split"));
+            let address = mark.get() as u64;
+            let gate_address = gate.get() as u64;
+            let null = std::ptr::null();
+            let mut q = null;
+            assert_eq!(crate::queue::create_x(null, &[0u32; 4] as *const _ as *const _, &object::IUNKNOWN, &mut q), S_OK);
+            assert_eq!(crate::queue::line_on(), matches!(mode.as_str(), "behind" | "thin"));
+            assert_eq!(crate::queue::cuts(), mode != "split");
+            let allocator = std::ptr::NonNull::<Object>::dangling().as_ptr().cast_const();
+            let record = |body: &dyn Fn(This, usize)| {
+                let mut list = null;
+                assert_eq!(create_list(null, 0, 0, allocator, null, &object::IUNKNOWN, &mut list), S_OK);
+                // SAFETY: the object starts with its method table.
+                let newer = unsafe { *list.cast::<*const *const ()>() } == NEWER_LIST_FUNCTIONS.0.as_ptr()
+                    || unsafe { *list.cast::<*const *const ()>() } == NEWER_THIN_FUNCTIONS.0.as_ptr();
+                body(list, usize::from(newer) * 16);
+                assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+                list
+            };
+            let write = |l, shift, dst, value| {
+                slot::<extern "system" fn(This, u64, u32, u32, u32)>(l, 0x228 + shift)(l, dst, value, 0, 0);
+            };
+            let wait = |l, shift, dst, value| {
+                slot::<extern "system" fn(This, u64, u32, u64)>(l, 0x238 + shift)(l, dst, 3, value);
+            };
+            let a = record(&|l, shift| {
+                if mode != "split" { write(l, shift, address, 1); }
+                wait(l, shift, gate_address, 1);
+                write(l, shift, address, 2);
+            });
+            let b = record(&|l, shift| {
+                wait(l, shift, address, 2);
+                write(l, shift, gate_address, 0);
+                write(l, shift, address, 9);
+            });
+            let open = record(&|l, shift| write(l, shift, gate_address, 1));
+            let reopen = record(&|l, shift| write(l, shift, gate_address, 1));
+            let mut other = null;
+            assert_eq!(crate::queue::create_x(null, &[0u32; 4] as *const _ as *const _, &object::IUNKNOWN, &mut other), S_OK);
+            let submit = |q, lists: &[This]| {
+                slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, lists.len() as u32, lists.as_ptr());
+                crate::queue::before_sync();
+                crate::host::settle_for_fence();
+            };
+            submit(q, &[a, b, a]);
+            if mode != "split" {
+                assert_eq!(unsafe { mark.get().read_volatile() }, 1);
+                submit(other, &[open]);
+            }
+            assert_eq!(unsafe { mark.get().read_volatile() }, if mode == "split" { 9 } else { 1 });
+            submit(other, &[reopen]);
+            assert_eq!(unsafe { mark.get().read_volatile() }, 2);
+            for object in [a, b, open, reopen, q, other] {
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+            }
+            return;
+        }
+        for mode in ["cut", "split", "behind", "thin"] {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "list::tests::repeated_lists_run_through_the_title_queue", "--nocapture"])
+                .env(CASE, mode)
+                .env("VICTORY_CUT_WAITS", if mode == "split" { "0" } else { "1" })
+                .env("VICTORY_QUEUE_WAIT", "1")
+                .env("VICTORY_SPLIT_WAITS", "1")
+                .env("VICTORY_CUT_WRITES", "0")
+                .env("VICTORY_JOIN_PARTS", "0")
+                .env("VICTORY_ASYNC_SUBMIT", if mode == "behind" { "1" } else { "0" })
+                .env("VICTORY_THIN", if mode == "thin" { "1" } else { "0" })
+                .env("VICTORY_LATE_WAIT", if matches!(mode, "behind" | "thin") { "3" } else { "0" })
+                .output().unwrap();
+            assert!(child.status.success(), "{mode}: {}\n{}", String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_allocation_failure_is_fatal() {
+        const CASE: &str = "VICTORY_TEST_REPLACEMENT_FAILURE";
+        if let Ok(which) = std::env::var(CASE) {
+            let mut a = boxed(0, std::ptr::null(), false);
+            let mut b = boxed(0, std::ptr::null(), false);
+            let a = std::ptr::from_mut(&mut *a).cast::<Object>().cast_const();
+            let b = std::ptr::from_mut(&mut *b).cast::<Object>().cast_const();
+            let (mut mark, lists) = (0u32, [a, b, a]);
+            let address = std::ptr::from_mut(&mut mark) as u64;
+            defer_write(a, address, Written::Value(1), 4);
+            if which == "cut" {
+                FAIL_FRESH_AFTER.set(Some(0));
+                cut(a, ValueWait { address, comparison: 3, reference: 1, wide: false });
+            } else {
+                close(a);
+                close(b);
+                // Fail on the second distinct recording, after one detaches.
+                FAIL_FRESH_AFTER.set(Some(1));
+                if which == "flat" {
+                    drop(detach(&lists));
+                } else {
+                    drop(detach_parts(&lists));
+                }
+            }
+            return; // Exit 0 if any path ever starts silently dropping work again.
+        }
+        for (which, expected) in [
+            ("cut", "cutting a command list at a memory wait"),
+            ("flat", "detaching a command list"),
+            ("parts", "detaching command-list parts"),
+        ] {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "list::tests::replacement_allocation_failure_is_fatal", "--nocapture"])
+                .env(CASE, which)
+                .output().unwrap();
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            assert!(!child.status.success() && stderr.contains(&format!("{expected}: injected host command-list allocation failure")), "{which}: {stderr}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacing_an_unsubmitted_list_does_not_inherit_its_wait() {
+        let null = std::ptr::null();
+        let mut list = boxed(0, null, false);
+        let ptr = |list: &mut List| std::ptr::from_mut(list).cast::<Object>().cast_const();
+        let value = 0u32;
+        let address = std::ptr::from_ref(&value) as u64;
+        wait_value(ptr(&mut list), address, 3, 1);
+        if crate::queue::cuts() && list.host.is_some() {
+            assert!(cut_list(ptr(&mut list)));
+        }
+        // Drop the recording and put another list at exactly the same address.
+        // This does not rely on the Windows heap recycling a particular block.
+        *list = *boxed(0, null, false);
+        assert!(!cut_list(ptr(&mut list)));
+        let waits = waits_by_list(&[ptr(&mut list)]);
+        assert_eq!(waits[0].len(), 0, "new list inherited an abandoned wait");
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

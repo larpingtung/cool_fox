@@ -52,8 +52,9 @@ enum Held {
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
-    /// (which it may reset meanwhile), and the order they run in.
-    Run(Vec<crate::list::Detached>, Vec<usize>),
+    /// (which it may reset meanwhile), and the order they run in. A list
+    /// named more than once shares one set of native lists.
+    Run(crate::list::Run),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
 }
@@ -134,7 +135,13 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if lock(&queue(this).held).is_empty() {
+    // A list named twice cannot be detached once for the fast prefix and
+    // again for the held suffix: its second occurrence would find the fresh,
+    // empty list the first detach left. Take the whole submission through
+    // `detach_parts`, which shares one set of native lists between every
+    // occurrence, and let `release_held` run the parts whose waits are met.
+    let repeated = crate::list::has_repeats(lists);
+    let cut_at = if lock(&queue(this).held).is_empty() {
         lists
             .iter()
             .position(|&l| crate::list::cut_list(l))
@@ -142,6 +149,7 @@ fn submit_cut(this: This, lists: &[This]) {
     } else {
         0
     };
+    let first = if repeated { 0 } else { cut_at };
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -191,9 +199,9 @@ fn submit_cut(this: This, lists: &[This]) {
         }
         {
             let mut held = lock(&queue(this).held);
-            for (waits, taken, order) in parts {
+            for (waits, run) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
-                held.push(Held::Run(taken, order));
+                held.push(Held::Run(run));
             }
         }
         let mut waiting = lock(&WAITING);
@@ -208,7 +216,7 @@ fn submit_cut(this: This, lists: &[This]) {
 
 /// A submission to a queue that honours waits, list by list ([`split`]).
 /// shortcut: a wait still holds its whole list, not only the commands
-/// after it; and lists named twice among those held stay in one piece.
+/// after it.
 #[cfg(windows)]
 fn submit_split(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
@@ -238,6 +246,15 @@ fn submit_split(this: This, lists: &[This]) {
             cut < lists.len()
         )
     });
+    // If a recording is needed on both sides of a wait, its descriptor
+    // tables and upload memory must not be retired by the fast path.
+    let cut = if (cut < lists.len() || by.iter().any(|waits| !waits.is_empty()))
+        && crate::list::has_repeats(lists)
+    {
+        0
+    } else {
+        cut
+    };
     if cut > 0 {
         let now: Vec<_> = lists[..cut]
             .iter()
@@ -256,26 +273,10 @@ fn submit_split(this: This, lists: &[This]) {
                 "lists of a submission are held for a memory value"
             );
         }
-        let rest = &lists[cut..];
-        // A list's host side can be taken once.
-        let twice = rest.iter().enumerate().any(|(i, l)| rest[..i].contains(l));
-        let mut pieces: Vec<Held> = Vec::new();
-        let mut from = cut;
-        while from < lists.len() {
-            // Up to the next list that waits for anything (met or not: it
-            // is looked at again when its turn comes).
-            let to = if twice {
-                lists.len()
-            } else {
-                (from + 1..lists.len())
-                    .find(|&i| !by[i].is_empty())
-                    .unwrap_or(lists.len())
-            };
-            let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
+        let mut pieces = Vec::new();
+        for (waits, run) in crate::list::detach_parts_with_waits(&lists[cut..], &by[cut..]) {
             pieces.extend(waits.into_iter().map(Held::Value));
-            let (taken, order) = crate::list::detach(&lists[from..to]);
-            pieces.push(Held::Run(taken, order));
-            from = to;
+            pieces.push(Held::Run(run));
         }
         lock(&queue(this).held).extend(pieces);
         let mut waiting = lock(&WAITING);
@@ -356,14 +357,19 @@ pub(crate) fn release_held(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(run) => {
                         #[cfg(feature = "diagnostics")]
-                        crate::capture::op(q, || {
-                            format!(
-                                "RUN held submission of {} lists (forced {all})",
-                                order.len()
-                            )
-                        });
+                        {
+                            let count = match &run {
+                                crate::list::Run::Owned(_, order)
+                                | crate::list::Run::Shared(_, order) => order.len(),
+                            };
+                            crate::capture::op(q, || {
+                                format!(
+                                    "RUN held submission of {count} lists (forced {all})"
+                                )
+                            });
+                        }
                         // Diagnostics: the part behind this one stands at
                         // waits that are met already, so the two could have
                         // been one host submission (one wait for the card,
@@ -378,28 +384,35 @@ pub(crate) fn release_held(all: bool) {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
                         }
-                        if crate::host::late()
-                            && let Some(host) = crate::host::host()
-                        {
-                            // Not waited for: the host keeps the lists
-                            // until they are settled.
-                            host.execute_late(lists, order);
-                        } else {
-                            let ran = {
-                                let runs: Vec<&crate::host::HostList> =
-                                    order.iter().map(|&i| lists[i].host()).collect();
-                                match crate::host::host() {
-                                    Some(host) => {
-                                        host.execute(&runs);
-                                        true
+                        match run {
+                            crate::list::Run::Owned(lists, order) => {
+                                if crate::host::late()
+                                    && let Some(host) = crate::host::host()
+                                {
+                                    // Not waited for: the host keeps the lists
+                                    // until they are settled.
+                                    host.execute_late(lists, order);
+                                } else {
+                                    let ran = {
+                                        let runs: Vec<&crate::host::HostList> =
+                                            order.iter().map(|&i| lists[i].host()).collect();
+                                        match crate::host::host() {
+                                            Some(host) => {
+                                                host.execute(&runs);
+                                                true
+                                            }
+                                            None => false,
+                                        }
+                                    };
+                                    // They have run: their host lists are used again.
+                                    if ran {
+                                        crate::list::recycle(lists, &order);
                                     }
-                                    None => false,
                                 }
-                            };
-                            // They have run: their host lists are used again.
-                            if ran {
-                                crate::list::recycle(lists, &order);
                             }
+                            // A repeated list: the shared set recycles itself
+                            // after the last occurrence has run.
+                            crate::list::Run::Shared(shared, order) => shared.run(&order),
                         }
                         if all {
                             #[cfg(feature = "diagnostics")]
@@ -606,7 +619,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         }
         let kept = hold(this, || {
             let (taken, order) = crate::list::detach(lists);
-            Held::Run(taken, order)
+            Held::Run(crate::list::Run::Owned(taken, order))
         });
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).
@@ -637,10 +650,17 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         release_held(false);
         return;
     }
-    let _ = this;
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    if !ONCE.swap(true, Ordering::Relaxed) {
-        tracing::warn!(count, "command lists submitted; no host GPU runs them");
+    #[cfg(windows)]
+    if count != 0 {
+        crate::host::fail(format_args!("cannot submit command lists: no host D3D12 device"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            tracing::warn!(count, "command lists submitted; no host GPU runs them");
+        }
     }
 }
 

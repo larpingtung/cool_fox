@@ -172,8 +172,7 @@ mod tests {
             unsafe {
                 host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
                 host.queue.Signal(&host.fence, *submitted).unwrap();
-                host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
-                WaitForSingleObject(host.event, INFINITE);
+                wait_host_fence(&host.fence, *submitted).unwrap();
             }
         }
         let done = crate::timeline::ticks();
