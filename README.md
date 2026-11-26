@@ -1,128 +1,132 @@
-# VIctory on an RX 7900 XTX
+# cool_fox
 
-## Run the codec_d Windows build
+### D3D12 Compatibility & Performance Engineering
 
-Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
+**An independent experimental engineering fork focused on graphics compatibility, CPU/GPU coordination, memory management and performance research.**
 
-```powershell
-$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
-.\Play-VIctory.cmd pareto-residency
-```
+Maintained by **[@larpingtung](https://github.com/larpingtung)**.
 
-The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
+cool_fox is a Rust-based research project built around a Windows Direct3D 12 compatibility layer. Its focus is the engineering underneath graphics workloads: command processing, resource lifetime, synchronization, memory movement, pipeline preparation and repeatable diagnostics.
 
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+The aim is straightforward: find measurable bottlenecks, fix correctness problems, reduce avoidable overhead and make performance work reproducible.
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+> **Status:** Experimental work in progress. This repository is not a production release and makes no claim of verified application-level performance gains.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+---
 
-## Where it stands (2026-11-25)
+## Development system
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+The primary local development and test machine:
 
-| | |
+| Component | Configuration |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+| CPU | AMD Ryzen 5 7500F |
+| GPU | NVIDIA GeForce RTX 4060 |
+| Dedicated VRAM | 8 GB GDDR6 |
+| System memory | 32 GB DDR5 |
+| Operating system | Windows 10 x64 |
+| Graphics API | Direct3D 12 |
+| Main implementation language | Rust |
 
-It started at 280 ms a frame in the same scenes two days earlier.
+These are the maintainer's development-system specifications, not minimum requirements or a compatibility guarantee.
 
-What is known to be wrong:
+## Engineering priorities
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+### CPU/GPU coordination
+- Investigate fence handling, queue dependencies and unnecessary waits.
+- Identify CPU submission bottlenecks and GPU idle gaps.
+- Improve command recording, batching and submission preparation.
+- Preserve correct ordering and resource-lifetime guarantees.
 
-## How to run it
+### Memory and resource lifetime
+- Audit allocation ownership, cleanup paths and unbounded retention.
+- Investigate upload, readback and staging-buffer reuse.
+- Track deferred resource retirement and descriptor reuse.
+- Distinguish confirmed leaks from caches, allocator reservations and temporary peaks.
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+### CPU performance and concurrency
+- Profile worker scheduling, lock contention and single-thread bottlenecks.
+- Reduce unnecessary copies, allocations and repeated work.
+- Evaluate data locality, SIMD and safe parallel execution.
+- Measure changes rather than assuming more threads are faster.
+
+### GPU resource and pipeline management
+- Investigate resource residency, heap and descriptor management.
+- Reduce avoidable resource transitions and submission overhead.
+- Examine pipeline initialization and warm-up behavior.
+- Keep hardware-specific paths guarded by correctness checks and portable fallbacks.
+
+### Streaming and diagnostics
+- Audit file-handle and resource ownership.
+- Measure decompression, transfer and temporary-buffer costs.
+- Use synthetic workloads and frame replay where suitable captures are available.
+- Record enough timing and allocation data to make regressions visible.
+
+## Current research direction
+
+The current development effort is focused on several concrete areas:
+
+- Upload-memory ownership and address-range tracking.
+- Correct handling of GPU fence failures and device-removal conditions.
+- Resource retirement only after confirmed GPU completion.
+- Reducing avoidable waits and background warm-up overhead.
+- DirectStorage bookkeeping and file-handle lifecycle.
+- Understanding memory high-water marks and the lifetime of transient buffers.
+- Measuring CPU submission work separately from GPU execution.
+
+Some experiments and fixes are being evaluated in a local working copy. **A local change should not be considered part of this public repository until it appears in its published commit history.** Reported synthetic benchmark results are not equivalent to application-level FPS gains.
+
+## Build and diagnostics
+
+The project uses a pinned Rust toolchain and the Windows MSVC build tools/Windows SDK.
+
+A release build can be produced from the repository root with:
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
+cargo build --release --locked -p victory
+```
+
+For the diagnostics profile:
+
+```powershell
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+See [docs/replay.md](docs/replay.md) for the existing frame-recording and replay workflow, and [docs/findings.md](docs/findings.md) for inherited performance notes. A replay is only representative of the workload captured; it does not replace full runtime testing.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+## Validation status and limitations
 
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
+Validation work may include source review, Rust compilation, unit/integration tests, static analysis, isolated microbenchmarks and synthetic graphics replay.
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+**No complete target-application build has been run against this experimental fork as part of the current validation.** No claims are made here about real-world FPS, sustained runtime performance, minimum RAM/VRAM requirements, long-session stability or broad hardware compatibility.
 
-## What is different here
+Any published measurement should identify:
+- The exact source revision and build configuration.
+- The hardware and driver used.
+- The workload and test method.
+- Whether it is a microbenchmark, synthetic replay or live runtime measurement.
+- Baseline and modified results, including regressions and limitations.
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
+Correctness and reproducibility come before performance claims.
 
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+## Project lineage and credits
 
-## Credits
+This repository is an independently maintained derivative of [VIctory](https://github.com/Marvisak/VIctory) and related open-source work. It builds on contributions from the original project and other developers; this fork does not claim authorship of the inherited implementation.
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+Credits from the inherited project and codebase:
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors: loader, runtime services, Direct3D 12 backend and shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork this codebase started from and its contributors.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: rendering fixes, cube gradients and sparse-texture work.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**: ambient-light ideas, pipeline workers and work by romainhedouin.
 - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: memory-view guard work and related contributions, including work by Spexivus, joroyt, tightfall and Joshua Odom.
+- **Geckomacabre** and **cxy0072019-sketch**: texture read-back contributions.
+- **[XCL](https://github.com/ivall/xcl)** was consulted as a reference for compatibility behavior; its code is not included here.
+- The inherited fork's changes included work prepared with [Claude Code](https://claude.com/claude-code).
+
+Original notices and contributor attribution in the source and Git history are retained.
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, as inherited from VIctory. See [LICENSE](LICENSE). The asset-policy exception is documented in [docs/asset-policy.md](docs/asset-policy.md).
