@@ -42,7 +42,6 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
-    event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
@@ -948,7 +947,6 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -972,7 +970,6 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
-            event,
             rtvs,
             rtv_size,
             dsvs,
@@ -1019,8 +1016,45 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// UINT64_MAX means device removal, not that every submission has finished.
+fn host_completed(fence: &ID3D12Fence) -> windows::core::Result<u64> {
+    // SAFETY: a query on a live fence.
+    match unsafe { fence.GetCompletedValue() } {
+        u64::MAX => Err(DXGI_ERROR_DEVICE_REMOVED.into()),
+        value => Ok(value),
+    }
+}
+
+fn wait_host_fence(fence: &ID3D12Fence, target: u64) -> windows::core::Result<()> {
+    if host_completed(fence)? < target {
+        // SAFETY: null requests a synchronous wait. Our fence never rewinds.
+        unsafe { fence.SetEventOnCompletion(target, HANDLE::default())? };
+        if host_completed(fence)? < target {
+            return Err(windows::Win32::Foundation::E_FAIL.into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_fence_wait_requires_real_completion() {
+        use super::*;
+        let Some(host) = host() else { return };
+        // SAFETY: a private test fence; no title or host submissions use it.
+        let fence: ID3D12Fence = unsafe { host.device.CreateFence(1, D3D12_FENCE_FLAG_NONE).unwrap() };
+        wait_host_fence(&fence, 1).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| wait_host_fence(&fence, 2).unwrap());
+            // SAFETY: signal our test fence, not the real submission fence.
+            unsafe { fence.Signal(2).unwrap() };
+        });
+        // Exercise the reserved removal value without removing the real device.
+        unsafe { fence.Signal(u64::MAX).unwrap() };
+        assert_eq!(wait_host_fence(&fence, 2).unwrap_err().code(), DXGI_ERROR_DEVICE_REMOVED);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -3266,11 +3300,6 @@ fn late_helper() {
     let Some(host) = host() else {
         return;
     };
-    // SAFETY: a plain event of our own.
-    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
-        tracing::warn!("no event for the thread that settles submissions sent ahead");
-        return;
-    };
     loop {
         let target = {
             let mut line = line();
@@ -3295,13 +3324,11 @@ fn late_helper() {
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
-        // SAFETY: our fence and event.
-        unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
+        {
+            #[cfg(feature = "diagnostics")]
+            let _card = crate::timeline::card_wait(Some(target));
+            wait_host_fence(&host.fence, target)
+                .unwrap_or_else(|e| fail(format_args!("late helper waiting for fence {target}: {e}")));
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3410,10 +3437,6 @@ fn relay_worker() {
     let Some(host) = host() else {
         return;
     };
-    // SAFETY: a plain event of our own.
-    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
-        fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
-    };
     let mut fetch: Option<RelayFetch> = None;
     loop {
         let next = {
@@ -3431,8 +3454,13 @@ fn relay_worker() {
                         _ => None,
                     })
                     .collect();
-                // SAFETY: a plain query.
-                let completed = unsafe { host.fence.GetCompletedValue() };
+                let completed = match host_completed(&host.fence) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        drop(line);
+                        fail(format_args!("relay cannot retire submissions: {e}"));
+                    }
+                };
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -3459,15 +3487,8 @@ fn relay_worker() {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
-                // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                wait_host_fence(&host.fence, target)
+                    .unwrap_or_else(|e| fail(format_args!("relay waiting for fence {target}: {e}")));
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -5037,7 +5058,7 @@ impl Host {
             let waiting = std::time::Instant::now();
             let (allocator, list) = &work.fetch;
             // SAFETY: the list's last run was waited for; live buffers; the
-            // fence and event are ours, under the submission lock.
+            // fence is ours, under the submission lock.
             let ran = unsafe {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
@@ -5050,9 +5071,8 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
-                    self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    wait_host_fence(&self.fence, *submitted)?;
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5125,6 +5145,21 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
+        self.execute_waited(runs);
+    }
+
+    fn execute_waited(&self, mut runs: &[&HostList]) {
+        // D3D12 cannot read a native command list again until its earlier
+        // execution completed. Keep distinct lists batched on this path.
+        let mut seen = std::collections::HashSet::new();
+        while runs.len() > 1 {
+            seen.clear();
+            let Some(at) = runs.iter().position(|&list| !seen.insert(std::ptr::from_ref(list))) else {
+                break;
+            };
+            let _ = self.submit(&runs[..at], &[], false);
+            runs = &runs[at..];
+        }
         let _ = self.submit(runs, &[], false);
     }
 
@@ -5150,6 +5185,18 @@ impl Host {
     /// at each place of `order` in `parts` ([`joins`]).
     pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         if order.is_empty() {
+            crate::list::recycle(lists, &order);
+            return;
+        }
+        if order.len() > lists.len() {
+            // Whole-submission mode can still supply repeated indices.
+            // Keep all owners here until the final (waited) execution.
+            let runs: Vec<_> = order.iter().map(|&i| lists[i].host()).collect();
+            let mut from = 0;
+            for to in parts.iter().copied().chain([runs.len()]) {
+                self.execute_waited(&runs[from..to]);
+                from = to;
+            }
             crate::list::recycle(lists, &order);
             return;
         }
@@ -5321,21 +5368,15 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            #[cfg(feature = "diagnostics")]
-                            let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
+                working(false);
+                {
+                    #[cfg(feature = "diagnostics")]
+                    let _card = crate::timeline::card_wait(Some(*submitted));
+                    wait_host_fence(&self.fence, *submitted)
+                        .unwrap_or_else(|e| fail(format_args!("cannot retire {flights} submissions at fence {submitted}: {e}")));
                 }
+                stood(waiting);
+                working(true);
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5767,27 +5808,21 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
+            // SAFETY: closed lists; the submission lock orders signals on our fence.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                self.queue.Signal(&self.fence, *submitted)
+                    .unwrap_or_else(|e| fail(format_args!("host submission fence signal failed: {e}")));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        #[cfg(feature = "diagnostics")]
-                        let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                working(false);
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(Some(*submitted));
+                wait_host_fence(&self.fence, *submitted)
+                    .unwrap_or_else(|e| fail(format_args!("host submission fence wait failed: {e}")));
+                stood(started);
+                working(true);
             }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
