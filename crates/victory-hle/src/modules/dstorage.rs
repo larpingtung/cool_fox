@@ -586,6 +586,8 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    #[cfg(test)]
+    bench: Option<(std::time::Instant, Vec<std::time::Duration>)>,
 }
 
 /// A queue's requests in the scheduler.
@@ -626,7 +628,6 @@ unsafe impl Send for Job {}
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
     static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
     let scheduler = SCHEDULER
         .get_or_init(|| {
             Some(Scheduler {
@@ -645,25 +646,41 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    #[cfg(test)]
+                    bench: None,
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
             })
         })
         .as_ref()?;
-    STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
-            .filter(|i| {
-                std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
-                    .is_ok()
-            })
-            .count();
-        tracing::info!(workers = started, "dstorage: workers");
+    let started = STARTED_WORKERS.get_or_init(|| {
+        const SETTING: &str = "VICTORY_DSTORAGE_WORKERS";
+        let default = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let mut workers = default;
+        if let Some(value) = std::env::var_os(SETTING) {
+            match value.to_str().and_then(|v| worker_override(v, default)) {
+                Some(count) => workers = count,
+                None => tracing::warn!(?value, default, "dstorage: invalid {SETTING}; using default"),
+            }
+        }
+        let mut started = 0;
+        for i in 0..workers {
+            match std::thread::Builder::new().name(format!("dstorage {i}")).spawn(|| work(scheduler)) {
+                Ok(_) => started += 1,
+                Err(error) => tracing::warn!(worker = i, %error, "dstorage: could not start worker"),
+            }
+        }
+        tracing::info!(workers = started, requested = workers, default, "dstorage: workers");
+        started
     });
-    Some(scheduler)
+    (*started != 0).then_some(scheduler)
+}
+
+static STARTED_WORKERS: OnceLock<usize> = OnceLock::new();
+
+fn worker_override(value: &str, available: usize) -> Option<usize> {
+    Some(value.trim().parse::<usize>().ok()?.clamp(1, available.min(64)))
 }
 
 impl Scheduler {
@@ -827,6 +844,10 @@ fn work(scheduler: &'static Scheduler) {
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
+        #[cfg(test)]
+        if let Some((submitted, latencies)) = &mut self.bench {
+            latencies.push(submitted.elapsed());
+        }
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
@@ -1810,6 +1831,20 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    mod worker_sweep;
+
+    #[test]
+    fn worker_override_is_bounded_without_changing_the_default() {
+        assert_eq!(worker_override("1", 12), Some(1));
+        assert_eq!(worker_override(" 6 ", 12), Some(6));
+        assert_eq!(worker_override("0", 12), Some(1));
+        assert_eq!(worker_override("1000", 12), Some(12));
+        assert_eq!(worker_override("1000", 128), Some(64));
+        assert_eq!(worker_override("-2", 12), None);
+        assert_eq!(worker_override("", 12), None);
+        assert_eq!(worker_override("184467440737095516160", 12), None);
+    }
+
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
@@ -2297,6 +2332,7 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            bench: None,
         }
     }
 
